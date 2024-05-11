@@ -48,6 +48,12 @@ pub struct WebsiteStats {
     uptime_pct: Option<i16>,
 }
 
+#[derive(Serialize, sqlx::FromRow, Template)]
+#[template(path = "index.html")]
+struct WebsiteLogs {
+    logs: Vec<WebsiteInfo>,
+}
+
 enum SplitBy {
     Hour,
     Day,
@@ -64,20 +70,38 @@ struct SingleWebsiteLogs {
 #[derive(sqlx::FromRow, Serialize)]
 pub struct Incident {
     time: DateTime<Utc>,
-    status: u16,
+    status: i16,
 }
 
 #[shuttle_runtime::main]
 async fn main(#[shuttle_shared_db::Postgres] db: PgPool) -> shuttle_axum::ShuttleAxum {
-    sqlx::migrate!()
-        .run(&db)
-        .await
-        .expect("Migrations went wrong!");
+    sqlx::migrate!().run(&db).await.unwrap();
 
-    let state = AppState::new(db);
-    let router = Router::new().route("/", get(hello_world)).with_state(state);
+    let state = AppState::new(db.clone());
+
+    tokio::spawn(async move {
+        check_websites(db).await;
+    });
+
+    let router = Router::new()
+        .route("/", get(get_websites))
+        .route("/websites", post(create_website))
+        .route(
+            "/websites/:alias",
+            get(get_website_by_alias).delete(delete_website),
+        )
+        .route("/styles.css", get(styles))
+        .with_state(state);
 
     Ok(router.into())
+}
+
+async fn styles() -> impl AxumIntoResponse {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "text/css")
+        .body(include_str!("../templates/styles.css").to_string())
+        .unwrap()
 }
 
 async fn create_website(
@@ -111,7 +135,7 @@ async fn get_website_by_alias(
         .await?;
 
     let last_24_hours_data = get_daily_stats(&website.alias, &state.db).await?;
-    let monthly_data = get_monthly_data(&website.alias, &state.db).await?;
+    let monthly_data = get_monthly_stats(&website.alias, &state.db).await?;
 
     let incidents = sqlx::query_as::<_, Incident>(
         "
@@ -183,6 +207,31 @@ async fn get_daily_stats(alias: &str, db: &PgPool) -> Result<Vec<WebsiteStats>, 
     Ok(data)
 }
 
+async fn get_monthly_stats(alias: &str, db: &PgPool) -> Result<Vec<WebsiteStats>, APIError> {
+    let data = sqlx::query_as::<_, WebsiteStats>(
+        r#"
+        SELECT date_trunc('day', created_at) as time,
+        CAST(COUNT(case when status = 200 then 1 end) * 100 / COUNT(*) AS int2) as uptime_pct
+        FROM logs
+        LEFT JOIN websites on website.id = logs.website_id
+        WHERE website.alias = $1
+        group by time
+        order by time asc
+        limit 30
+        "#,
+    )
+    .bind(alias)
+    .fetch_all(db)
+    .await?;
+
+    let number_of_splits = 30;
+    let number_of_seconds = 86400;
+
+    let data = fill_data_gaps(data, number_of_splits, SplitBy::Day, number_of_seconds);
+
+    Ok(data)
+}
+
 fn fill_data_gaps(
     mut data: Vec<WebsiteStats>,
     splits: i32,
@@ -235,7 +284,7 @@ async fn check_websites(db: PgPool) {
             let response = ctx.get(website.url).send().await.unwrap();
 
             sqlx::query(
-                "INSERT INTO logs (website_alias, status)
+                "INSERT INTO logs (website_id, status)
             VALUES ((SELECT id FROM websites WHERE alias = $1), $2)
             ",
             )
