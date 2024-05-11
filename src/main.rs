@@ -189,7 +189,7 @@ async fn get_daily_stats(alias: &str, db: &PgPool) -> Result<Vec<WebsiteStats>, 
         CAST(COUNT(case when status = 200 then 1 end) * 100 / COUNT(*) AS int2) as uptime_pct
         FROM logs
         LEFT JOIN websites on websites.id = logs.website_id
-        WHERE website.alias = $1
+        WHERE websites.alias = $1
         group by time
         order by time asc
         limit 24
@@ -213,8 +213,8 @@ async fn get_monthly_stats(alias: &str, db: &PgPool) -> Result<Vec<WebsiteStats>
         SELECT date_trunc('day', created_at) as time,
         CAST(COUNT(case when status = 200 then 1 end) * 100 / COUNT(*) AS int2) as uptime_pct
         FROM logs
-        LEFT JOIN websites on website.id = logs.website_id
-        WHERE website.alias = $1
+        LEFT JOIN websites on websites.id = logs.website_id
+        WHERE websites.alias = $1
         group by time
         order by time asc
         limit 30
@@ -302,7 +302,7 @@ async fn delete_website(
     Path(alias): Path<String>,
 ) -> Result<impl AxumIntoResponse, APIError> {
     let mut tx = state.db.begin().await?;
-    if let Err(e) = sqlx::query("DELETE FROM logs WHERE website_alias = $1")
+    if let Err(e) = sqlx::query("DELETE FROM logs WHERE website_id = (SELECT id FROM websites WHERE alias = $1)")
         .bind(&alias)
         .execute(&mut *tx)
         .await
